@@ -1,24 +1,31 @@
-import types
-import sys
 import os
+import sys
+import types
 import importlib
 import ftrack_api
-
+import time
+import logging
 from app.api import Logger
+
 log = Logger.getLogger(__name__)
+
 """
 # Required - Needed for connection to Ftrack
 FTRACK_SERVER # Ftrack server e.g. "https://myFtrack.ftrackapp.com"
-FTRACK_API_KEY # Ftrack API key of user e.g. "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+FTRACK_API_KEY # Ftrack user's API key "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 FTRACK_API_USER # Ftrack username e.g. "user.name"
 
 # Required - Paths to folder with actions
-FTRACK_ACTIONS_PATH # Paths to folders where are located actions e.g. "M:/FtrackApi/../actions/"
-FTRACK_EVENTS_PATH # Paths to folders where are located actions e.g. "M:/FtrackApi/../events/"
+FTRACK_ACTIONS_PATH # Paths to folders where are located actions
+    - EXAMPLE: "M:/FtrackApi/../actions/"
+FTRACK_EVENTS_PATH # Paths to folders where are located actions
+    - EXAMPLE: "M:/FtrackApi/../events/"
 
 # Required - Needed for import included modules
-PYTHONPATH # Path to ftrack_api and paths to all modules used in actions e.g. path to ftrack_action_handler
+PYTHONPATH # Path to ftrack_api and paths to all modules used in actions
+    - path to ftrack_action_handler, etc.
 """
+
 
 class FtrackServer():
     def __init__(self, type='action'):
@@ -30,60 +37,116 @@ class FtrackServer():
                 ...
                 server = FtrackServer('event')
                 server.run_server()
-                ...
+                ..
         """
+        # set Ftrack logging to Warning only - OPTIONAL
+        ftrack_log = Logger.getLogger("ftrack_api")
+        ftrack_log.setLevel(logging.WARNING)
+
         self.type = type
         self.actionsAvailable = True
         self.eventsAvailable = True
         # Separate all paths
-        try:
-            self.actionsPaths = os.environ["FTRACK_ACTIONS_PATH"].split(os.pathsep)
-        except:
+        if "FTRACK_ACTIONS_PATH" in os.environ:
+            all_action_paths = os.environ["FTRACK_ACTIONS_PATH"]
+            self.actionsPaths = all_action_paths.split(os.pathsep)
+        else:
             self.actionsAvailable = False
-        try:
-            self.eventsPaths = os.environ["FTRACK_EVENTS_PATH"].split(os.pathsep)
-        except:
+
+        if "FTRACK_EVENTS_PATH" in os.environ:
+            all_event_paths = os.environ["FTRACK_EVENTS_PATH"]
+            self.eventsPaths = all_event_paths.split(os.pathsep)
+        else:
             self.eventsAvailable = False
 
     def stop_session(self):
-        self.session.event_hub.disconnect()
+        if self.session.event_hub.connected is True:
+            self.session.event_hub.disconnect()
         self.session.close()
         self.session = None
 
     def set_files(self, paths):
         # Iterate all paths
+        functions = []
         for path in paths:
             # add path to PYTHON PATH
-            sys.path.append(path)
+            if path not in sys.path:
+                sys.path.append(path)
+
             # Get all modules with functions
             for m in os.listdir(path):
                 # Get only .py files with action functions
                 if '.pyc' in m or '.py' not in m:
                     continue
-                try:
-                    mod = importlib.import_module(os.path.splitext(m)[0])
-                    mod_functions = dict([(name, function)
-                                      for name, function in mod.__dict__.items() if isinstance(
-                    function, types.FunctionType)])
-                        # Run register on each action
-                    mod_functions['register'](self.session)
 
-                except KeyError as e:
-                    log.warning("'{0}' - not proper {1} (Missing register method in action)".format(m, self.type))
-                except Exception as e:
-                    log.warning("'{0}' - not proper {1} ({2})".format(m, self.type, e))
+                ignore = 'ignore_me'
+                mod = importlib.import_module(os.path.splitext(m)[0])
+                importlib.reload(mod)
+                mod_functions = dict(
+                    [
+                        (name, function)
+                        for name, function in mod.__dict__.items()
+                        if isinstance(
+                            function, types.FunctionType
+                        ) or name == ignore
+                    ]
+                )
+                # Don't care about ignore_me files
+                if (
+                    ignore in mod_functions and
+                    mod_functions[ignore] is True
+                ):
+                    continue
+                # separate files by register function
+                if 'register' not in mod_functions:
+                    msg = (
+                        '"{0}" - not proper {1} (Missing register method)'
+                    ).format(m, self.type)
+                    log.warning(msg)
+                    continue
+
+                functions.append({
+                    'name': m,
+                    'register': mod_functions['register']
+                })
+
+        if len(functions) < 1:
+            raise Exception
+
+        for function in functions:
+            try:
+                function['register'](self.session)
+            except Exception as e:
+                msg = '"{}" register was not successful ({})'.format(
+                    function['name'], str(e)
+                )
+                log.warning(msg)
+            time.sleep(0.05)
 
     def run_server(self):
         self.session = ftrack_api.Session(auto_connect_event_hub=True,)
+
         if self.type.lower() == 'event':
             if self.eventsAvailable is False:
-                log.error("FTRACK_EVENTS_PATH is not set, event server won't launch")
+                msg = (
+                    'FTRACK_EVENTS_PATH is not set'
+                    ', event server won\'t launch'
+                )
+                log.error(msg)
                 return
             self.set_files(self.eventsPaths)
         else:
             if self.actionsAvailable is False:
-                log.error("FTRACK_ACTIONS_PATH is not set, action server won't launch")
+                msg = (
+                    'FTRACK_ACTIONS_PATH is not set'
+                    ', action server won\'t launch'
+                )
+                log.error(msg)
                 return
             self.set_files(self.actionsPaths)
+
+        log.info(60*"*")
+        log.info('Registration of actions/events has finished!')
+
         # keep event_hub on session running
         self.session.event_hub.wait()
